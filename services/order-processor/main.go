@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -19,6 +20,7 @@ var (
 	redisDedupPrefix = "dedup:order:"
 	dedupTTL = 5 * time.Minute
 	outputTopic = "orders.validate"
+	dlqTopic  = "orders.dlq"
 )
 
 type Order struct {
@@ -43,21 +45,21 @@ func main() {
 			cancel()
 	}()
 	
-	rdb := redis.NewClient(&redis.NewClient(
-			Addr: getENV("REDIS_ADDR", "localhost:6379")
-			Password: " ".
+	rdb := redis.NewClient(&redis.Options{
+			Addr: getENV("REDIS_ADDR", "localhost:6379"),
+			Password: "",
 			DB: 0,
-	))
+		})
 
 	consumer, err := kafka.NewConsumer(&kafka.ConfigMap{
 					"bootstrap.servers": getENV("KAFKA_BOOTSTRAP", "localhost:9092"),
 					"group.id" : "order.processor",
 					"enable.auto.commit": false,
-					"auto.offset.reset" : "earliest".
+					"auto.offset.reset" : "earliest",
 	})
 
 	if err != nil {
-		log.Fatalf("Failed to create consumer:", %v)
+		log.Fatalf("Failed to create consumer: %v", err)
 	}
 
 	defer consumer.Close()
@@ -89,7 +91,7 @@ func main() {
 		default:
 				msg, err := consumer.ReadMessage(500 * time.Millisecond)
 				if err != nil {
-						if kafkaErr, ok := err.(kafka.Error); ok && kafkaErr.Code() == kafka.ErrorTimeOut {
+						if kafkaErr, ok := err.(kafka.Error); ok && kafkaErr.Code() == kafka.ErrTimedOut {
 								continue
 						}
 						log.Printf("consumer err: %v", err)
@@ -105,8 +107,8 @@ func main() {
 						continue
 				}
 
-				redisKey := redisDedupPrefix + orderID
-				ok, err := rdb.SETNX(ctx, redisKey, "1", dedupTTL).Result()
+				redisKey := redisDedupPrefix + order.OrderID
+				ok, err := rdb.SetNX(ctx, redisKey, "1", dedupTTL).Result()
 				if err != nil {
 						log.Printf("Redis error: %v", err)
 						sendToDLQ(producer, msg.Value, fmt.Sprintf("parse error: %v", err))
@@ -123,7 +125,7 @@ func main() {
 				orderBytes, _ := json.Marshal(order)
 				err = producer.Produce(&kafka.Message{
 							TopicPartition: kafka.TopicPartition{Topic: &outputTopic, Partition: kafka.PartitionAny},
-							Value: orderBytes
+							Value: orderBytes,
 				}, nil)
 				if err != nil {
 						log.Printf("Failed to publish order: %v", err)
@@ -131,7 +133,7 @@ func main() {
 						continue
 				}
 			
-				_, err := consumer.CommitMessage(msg)
+				_, err = consumer.CommitMessage(msg)
 				if err != nil {
 						log.Printf("Offset commit failed: %v", err)
 				}		
