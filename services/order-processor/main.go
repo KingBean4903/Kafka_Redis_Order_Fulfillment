@@ -2,10 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os/signal"
-	"string"
+	"strings"
 	"syscall"
 	"time"
 
@@ -14,11 +15,19 @@ import (
 )
 
 var (
-
 	topic = "orders.placed"
 	redisDedupPrefix = "dedup:order:"
 	dedupTTL = 5 * time.Minute
+	outputTopic = "orders.validate"
 )
+
+type Order struct {
+	OrderID string `json:"order_id"`
+	UserID  string `json:"user_id"`
+	SKU     string `json:"sku"`
+	Qty     string `json:"qty"`
+}
+
 
 func main() {
 	
@@ -52,6 +61,17 @@ func main() {
 	}
 
 	defer consumer.Close()
+	
+	producer, err := kafka.NewProducer(&kafka.ConfigMap{
+			"bootstrap.servers" : getENV("KAFKA_BOOTSTRAP", "localhost:9092"),
+	})
+
+	if err != nil {
+			log.Fatalf("Failed to create producer: %v", err)
+	}
+	
+	defer producer.Close()
+
 	err = consumer.SubscribeTopics([]string{topic}, nil)
 
 	if err != nil {
@@ -76,18 +96,41 @@ func main() {
 						continue
 				}
 
-				orderID := extractOrderID(string(msg.Value))
-				redisKey := redisDedupPrefix + orderID
-
-				ok, err := rdb.SETNX(ctx, redisKey, "1", dedupTTL).Result()
+	//			orderID := extractOrderID(string(msg.Value))
+		
+				order, err := parseOrder(msg.Value)
 				if err != nil {
-						log.Printf("Redis error: %v", err)
+						log.Printf("Invalid order format: %v", err)
+						sendToDLQ(producer, msg.Value, fmt.Sprintf("parse error: %v", err))
 						continue
 				}
 
-				log.Printf("Processing order %s", orderID)
-				// TODO validate order
-				
+				redisKey := redisDedupPrefix + orderID
+				ok, err := rdb.SETNX(ctx, redisKey, "1", dedupTTL).Result()
+				if err != nil {
+						log.Printf("Redis error: %v", err)
+						sendToDLQ(producer, msg.Value, fmt.Sprintf("parse error: %v", err))
+						continue
+				}
+
+				if !ok {
+						log.Printf("Duplicate order %s skipped", order.OrderID)
+						consumer.CommitMessage(msg)
+						continue
+				}
+
+				log.Printf("Validating and forwarding order: %s", order.OrderID)
+				orderBytes, _ := json.Marshal(order)
+				err = producer.Produce(&kafka.Message{
+							TopicPartition: kafka.TopicPartition{Topic: &outputTopic, Partition: kafka.PartitionAny},
+							Value: orderBytes
+				}, nil)
+				if err != nil {
+						log.Printf("Failed to publish order: %v", err)
+						sendToDLQ(producer, msg.Value, fmt.Sprintf("parse error: %v", err))
+						continue
+				}
+			
 				_, err := consumer.CommitMessage(msg)
 				if err != nil {
 						log.Printf("Offset commit failed: %v", err)
@@ -97,9 +140,33 @@ func main() {
 	}
 }
 
-func extractOrderID(value string) string {
+func sendToDLQ(p *kafka.Producer, original []byte, reason string) { 
 	
-	return strings.TrimSpace(value)
+	dlqMessage := map[string]interface{} {
+			"timestamp" : time.Now().UTC().Format(time.RFC3339),
+			"original" : string(original),
+			"reason": reason,
+	}
+	dlqBytes, _ := json.Marshal(dlqMessage)
+
+	_ = p.Produce(&kafka.Message{
+				TopicPartition: kafka.TopicPartition{Topic: &dlqTopic, Partition: kafka.PartitionAny},
+				Value: dlqBytes,
+	}, nil)
+
+}
+
+
+// Function to parse order
+func parseOrder(data []byte) (*Order, error) {
+		
+	var o Order
+	err := json.Unmarshal(data, &o)
+	if err != nil || strings.TrimSpace(o.OrderID) == " " {
+			return nil, fmt.Errorf("Invalid order payload")
+	}
+	return &o, nil
+
 }
 
 func getENV(key, fallback string) string {
